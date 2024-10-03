@@ -95,9 +95,9 @@ def create_app():
         opustags_command = [
             'opustags',
             '--overwrite',
-            '-o', output_path,
             '--delete-all',
-            '--set-vendor', 'WhatsApp'
+            '--set-vendor', 'WhatsApp',
+            output_path
         ]
         result = subprocess.run(
             opustags_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
