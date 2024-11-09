@@ -1,316 +1,251 @@
-package main
+import logging
+import os
+import subprocess
+import base64
+import uuid
+from flask import Flask, request, send_file, jsonify
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
+from functools import wraps
+from flask_cors import CORS
+import tempfile
 
-import (
-	"bytes"
-	"encoding/base64"
-	"errors"
-	"flag"
-	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"sync"
 
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-	"github.com/joho/godotenv"
-)
+def create_app():
+    app = Flask(__name__)
 
-var (
-	apiKey         string
-	httpClient     = &http.Client{}
-	bufferPool     = sync.Pool{
-		New: func() interface{} {
-			return new(bytes.Buffer)
-		},
-	}
-	allowedOrigins []string
-	uploadFolder   = "/tmp/uploads"
-)
+    # Configurações
+    app.config['MAX_CONTENT_LENGTH'] = 20 * \
+        1024 * 1024  # Limite de 20 MB para uploads
+    UPLOAD_FOLDER = '/tmp/uploads'
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-// Formatos suportados como no Python
-var supportedFormats = map[string]string{
-	"audio/mpeg":                "mp3",
-	"audio/wav":                 "wav",
-	"audio/x-wav":              "wav",
-	"audio/aac":                "aac",
-	"audio/x-aac":              "aac",
-	"audio/flac":               "flac",
-	"audio/x-flac":             "flac",
-	"audio/ogg":                "ogg",
-	"audio/opus":               "opus",
-	"audio/webm":               "webm",
-	"video/webm":               "webm",
-	"audio/3gpp":               "3gp",
-	"audio/3gpp2":              "3g2",
-	"audio/mp4":                "m4a",
-	"video/mp4":                "mp4",
-	"application/octet-stream": "",
-}
+    # Configuração de Logging
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
 
-func init() {
-	devMode := flag.Bool("dev", false, "Rodar em modo de desenvolvimento")
-	flag.Parse()
+    # Configurações de CORS e API Key do código Go
+    api_key = os.getenv('API_KEY')
+    allowed_origins = os.getenv('CORS_ALLOW_ORIGINS', '*').split(',')
 
-	if *devMode {
-		if err := godotenv.Load(); err != nil {
-			fmt.Println("Erro ao carregar o arquivo .env")
-		}
-	}
+    # Configurar CORS
+    cors = CORS(app, resources={
+        r"/*": {
+            "origins": allowed_origins,
+            "methods": ["POST", "GET", "OPTIONS"],
+            "allow_headers": ["Origin", "Content-Type", "Accept", "Authorization", "apikey"]
+        }
+    })
 
-	// Criar diretório de upload
-	if err := os.MkdirAll(uploadFolder, 0755); err != nil {
-		fmt.Printf("Erro ao criar diretório de upload: %v\n", err)
-	}
+    # Formatos de entrada suportados (MIME types)
+    SUPPORTED_FORMATS = {
+        'audio/mpeg': 'mp3',
+        'audio/wav': 'wav',
+        'audio/x-wav': 'wav',
+        'audio/aac': 'aac',
+        'audio/x-aac': 'aac',
+        'audio/flac': 'flac',
+        'audio/x-flac': 'flac',
+        'audio/ogg': 'ogg',
+        'audio/opus': 'opus',
+        'audio/webm': 'webm',
+        'video/webm': 'webm',
+        'audio/3gpp': '3gp',
+        'audio/3gpp2': '3g2',
+        'audio/mp4': 'm4a',
+        'video/mp4': 'mp4',
+        'application/octet-stream': ''
+    }
 
-	apiKey = os.Getenv("API_KEY")
-	allowOriginsEnv := os.Getenv("CORS_ALLOW_ORIGINS")
-	if allowOriginsEnv != "" {
-		allowedOrigins = strings.Split(allowOriginsEnv, ",")
-	} else {
-		allowedOrigins = []string{"*"}
-	}
-}
+    def validate_api_key(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not api_key:
+                return jsonify({'error': 'API key não configurada no servidor'}), 500
 
-func validateAPIKey(c *gin.Context) bool {
-	if apiKey == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "API_KEY não configurada"})
-		return false
-	}
+            request_api_key = request.headers.get('apikey')
+            if not request_api_key:
+                return jsonify({'error': 'API key não fornecida'}), 401
 
-	requestApiKey := c.GetHeader("apikey")
-	if requestApiKey == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "API_KEY não fornecida"})
-		return false
-	}
+            if request_api_key != api_key:
+                return jsonify({'error': 'API key inválida'}), 401
 
-	if requestApiKey != apiKey {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "API_KEY inválida"})
-		return false
-	}
+            return f(*args, **kwargs)
+        return decorated_function
 
-	return true
-}
+    def fix_audio(input_path, fixed_input_path):
+        ffmpeg_fix_command = [
+            'ffmpeg',
+            '-y',
+            '-i', input_path,
+            '-vn',
+            '-acodec', 'libmp3lame',
+            '-ar', '44100',
+            '-ab', '192k',
+            '-f', 'mp3',
+            fixed_input_path
+        ]
+        result = subprocess.run(
+            ffmpeg_fix_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Erro no ffmpeg (fix_audio): {result.stderr}")
+        logging.info("Arquivo de áudio corrigido.")
 
-func generateTempFilename(extension string) string {
-	return filepath.Join(uploadFolder, fmt.Sprintf("%s.%s", uuid.New().String(), extension))
-}
+    def convert_audio(fixed_input_path, output_path):
+        ffmpeg_command = [
+            'ffmpeg',
+            '-y',
+            '-i', fixed_input_path,
+            '-c:a', 'libopus',
+            '-b:a', '18.9k',
+            '-ar', '16000',
+            '-ac', '1',
+            output_path
+        ]
+        result = subprocess.run(
+            ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Erro no ffmpeg (convert_audio): {result.stderr}")
+        logging.info("Conversão de áudio bem-sucedida.")
 
-// Funções de processamento de áudio adaptadas do Python
-func fixAudio(inputPath, fixedInputPath string) error {
-	cmd := exec.Command("ffmpeg",
-		"-y",
-		"-i", inputPath,
-		"-vn",
-		"-acodec", "libmp3lame",
-		"-ar", "44100",
-		"-ab", "192k",
-		"-f", "mp3",
-		fixedInputPath,
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("erro no ffmpeg (fix_audio): %v - %s", err, string(output))
-	}
-	return nil
-}
+    def set_opus_tags(output_path):
+        opustags_command = [
+            'opustags',
+            '--overwrite',
+            '--delete-all',
+            '--set-vendor', 'WhatsApp',
+            output_path
+        ]
+        result = subprocess.run(
+            opustags_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Erro no opustags: {result.stderr}")
+        logging.info("Tags Opus definidas com sucesso.")
 
-func convertAudio(fixedInputPath, outputPath string) error {
-	cmd := exec.Command("ffmpeg",
-		"-y",
-		"-i", fixedInputPath,
-		"-c:a", "libopus",
-		"-b:a", "18.9k",
-		"-ar", "16000",
-		"-ac", "1",
-		outputPath,
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("erro no ffmpeg (convert_audio): %v - %s", err, string(output))
-	}
-	return nil
-}
+    def get_audio_duration(output_path):
+        ffprobe_command = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            output_path
+        ]
+        result = subprocess.run(
+            ffprobe_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Erro no ffprobe: {result.stderr}")
+        duration_sec = float(result.stdout.strip())
+        duration_ms = round(duration_sec * 1000)
+        return duration_ms
 
-func setOpusTags(outputPath string) error {
-	cmd := exec.Command("opustags",
-		"--overwrite",
-		"--delete-all",
-		"--set-vendor", "WhatsApp",
-		outputPath,
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("erro no opustags: %v - %s", err, string(output))
-	}
-	return nil
-}
+    def generate_temp_filename(extension=''):
+        return os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}{f'.{extension}' if extension else ''}")
 
-func getAudioDuration(outputPath string) (int, error) {
-	cmd := exec.Command("ffprobe",
-		"-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		outputPath,
-	)
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("erro no ffprobe: %v", err)
-	}
-	duration, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
-	if err != nil {
-		return 0, err
-	}
-	return int(duration * 1000), nil
-}
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_large_file(error):
+        logging.error("Arquivo excede o tamanho máximo permitido.")
+        return jsonify({'error': 'Arquivo muito grande'}), 413
 
-func getInputData(c *gin.Context) (string, string, error) {
-	contentType := c.GetHeader("Content-Type")
-	var inputPath string
-	var extension string
+    @app.route('/process-audio', methods=['POST'])
+    @validate_api_key
+    def process_audio():
+        try:
+            # Determina o formato de resposta com base no header 'Accept'
+            accept_header = request.headers.get('Accept', '')
+            response_format = 'base64' if 'application/json' in accept_header else 'binary'
 
-	switch {
-	case contentType == "application/octet-stream":
-		data, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			return "", "", err
-		}
-		extension = "wav"
-		inputPath = generateTempFilename(extension)
-		if err := os.WriteFile(inputPath, data, 0644); err != nil {
-			return "", "", err
-		}
+            # Determina o tipo de conteúdo da requisição
+            content_type = request.content_type or ''
+            logging.info(f"Tipo de conteúdo recebido: {content_type}")
 
-	case contentType == "application/json":
-		var jsonData struct {
-			Audio string `json:"audio"`
-		}
-		if err := c.BindJSON(&jsonData); err != nil {
-			return "", "", err
-		}
-		audioData, err := base64.StdEncoding.DecodeString(jsonData.Audio)
-		if err != nil {
-			return "", "", err
-		}
-		extension = "wav"
-		inputPath = generateTempFilename(extension)
-		if err := os.WriteFile(inputPath, audioData, 0644); err != nil {
-			return "", "", err
-		}
+            input_path = None
+            fixed_input_path = None
+            output_path = None
 
-	case strings.HasPrefix(contentType, "multipart/form-data"):
-		file, err := c.FormFile("file")
-		if err != nil {
-			return "", "", err
-		}
-		
-		if file.Size > 20*1024*1024 { // 20MB limit
-			return "", "", errors.New("arquivo muito grande")
-		}
-		
-		extension = supportedFormats[file.Header.Get("Content-Type")]
-		if extension == "" {
-			originalExt := filepath.Ext(file.Filename)
-			if originalExt != "" {
-				extension = strings.TrimPrefix(originalExt, ".")
-			} else {
-				extension = "wav"
-			}
-		}
-		
-		inputPath = generateTempFilename(extension)
-		if err := c.SaveUploadedFile(file, inputPath); err != nil {
-			return "", "", err
-		}
+            try:
+                # Processar diferentes tipos de entrada (como no código Go)
+                if content_type == 'application/octet-stream':
+                    audio_data = request.get_data()
+                    input_path = generate_temp_filename('wav')
+                    with open(input_path, 'wb') as f:
+                        f.write(audio_data)
 
-	default:
-		return "", "", errors.New("tipo de conteúdo não suportado")
-	}
+                elif content_type == 'application/json':
+                    json_data = request.get_json()
+                    if not json_data or 'audio' not in json_data:
+                        return jsonify({'error': 'Dados de áudio não fornecidos'}), 400
 
-	return inputPath, extension, nil
-}
+                    audio_data = base64.b64decode(json_data['audio'])
+                    input_path = generate_temp_filename('wav')
+                    with open(input_path, 'wb') as f:
+                        f.write(audio_data)
 
-func processAudio(c *gin.Context) {
-	if !validateAPIKey(c) {
-		return
-	}
+                elif 'file' in request.files:
+                    file = request.files['file']
+                    if file.filename == '':
+                        return jsonify({'error': 'Nenhum arquivo selecionado'}), 400
 
-	inputPath, _, err := getInputData(c)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+                    extension = SUPPORTED_FORMATS.get(file.content_type, '')
+                    if not extension and '.' in file.filename:
+                        extension = file.filename.rsplit('.', 1)[1].lower()
 
-	// Criar nomes de arquivos temporários
-	fixedInputPath := generateTempFilename("mp3")
-	outputPath := generateTempFilename("ogg")
+                    input_path = generate_temp_filename(extension or 'wav')
+                    file.save(input_path)
 
-	defer func() {
-		// Limpar arquivos temporários
-		os.Remove(inputPath)
-		os.Remove(fixedInputPath)
-		os.Remove(outputPath)
-	}()
+                else:
+                    return jsonify({'error': 'Tipo de conteúdo não suportado'}), 415
 
-	// Processar áudio usando a lógica do Python
-	if err := fixAudio(inputPath, fixedInputPath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+                # Processar o áudio
+                fixed_input_path = generate_temp_filename('mp3')
+                fix_audio(input_path, fixed_input_path)
 
-	if err := convertAudio(fixedInputPath, outputPath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+                output_path = generate_temp_filename('ogg')
+                convert_audio(fixed_input_path, output_path)
 
-	if err := setOpusTags(outputPath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+                set_opus_tags(output_path)
+                duration_ms = get_audio_duration(output_path)
 
-	duration, err := getAudioDuration(outputPath)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+                # Retornar resposta no formato apropriado
+                if response_format == 'base64':
+                    with open(output_path, "rb") as audio_file:
+                        base64_audio = base64.b64encode(
+                            audio_file.read()).decode('utf-8')
+                    return jsonify({
+                        'audio': base64_audio,
+                        'duration': duration_ms,
+                        'format': 'ogg'
+                    })
+                else:
+                    response = send_file(
+                        output_path,
+                        mimetype='audio/ogg',
+                        as_attachment=True,
+                        download_name='converted_audio.ogg'
+                    )
+                    response.headers['Duration'] = str(duration_ms)
+                    return response
 
-	// Determinar formato de resposta
-	acceptHeader := c.GetHeader("Accept")
-	if strings.Contains(acceptHeader, "application/json") {
-		// Retornar como JSON com base64
-		audioData, err := os.ReadFile(outputPath)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "erro ao ler arquivo convertido"})
-			return
-		}
-		base64Audio := base64.StdEncoding.EncodeToString(audioData)
-		c.JSON(http.StatusOK, gin.H{
-			"base64Audio": base64Audio,
-			"duration_ms": duration,
-		})
-	} else {
-		// Retornar como arquivo binário
-		c.Header("Duration", fmt.Sprintf("%d", duration))
-		c.FileAttachment(outputPath, "converted_audio.ogg")
-	}
-}
+            finally:
+                # Limpar arquivos temporários
+                for path in [input_path, fixed_input_path, output_path]:
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                            logging.info(
+                                f"Arquivo temporário removido: {path}")
+                        except Exception as e:
+                            logging.warning(
+                                f"Não foi possível remover {path}: {e}")
 
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+        except Exception as e:
+            logging.error(f"Erro durante o processamento: {e}")
+            return jsonify({'error': str(e)}), 500
 
-	router := gin.Default()
+    return app
 
-	config := cors.DefaultConfig()
-	config.AllowOrigins = allowedOrigins
-	config.AllowMethods = []string{"POST", "GET", "OPTIONS"}
-	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization", "apikey"}
 
-	router.Use(cors.New(config))
-	router.POST("/convert", processAudio)
-
-	router.Run(":" + port)
-}
+# Configuração para execução do app
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    app = create_app()
+    app.run(host='0.0.0.0', port=port, debug=False)
